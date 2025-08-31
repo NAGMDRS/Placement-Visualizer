@@ -2,3 +2,4 @@
 .env
 credentials.json
 temp.py
+placement_data.log
