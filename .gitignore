@@ -2,4 +2,4 @@
 .env
 credentials.json
 temp.py
-placement_data.log
+placement_data_consolidated.log
