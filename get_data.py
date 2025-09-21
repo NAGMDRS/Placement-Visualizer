@@ -11,26 +11,28 @@ from selenium.webdriver.support.ui import Select
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import TimeoutException, NoSuchElementException
 from selenium.webdriver.chrome.options import Options
+from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 import os
 from datetime import datetime
+from urllib.parse import urljoin
+from multiprocessing import Pool, cpu_count
 
 load_dotenv()
-
-# Configuration
 PORTAL_URL = os.getenv('PORTAL_URL')
 USERNAME = os.getenv('TPUSERNAME')
 PASSWORD = os.getenv('PASSWORD')
 WEBDRIVER_PATH = os.getenv('WEBDRIVER_PATH')
+G_SHEET_ID = os.getenv('GOOGLE_SHEET_KEY')
+BASE_URL = "https://tp.bitmesra.co.in/"
 GCP_CREDS_FILE = 'credentials.json'
-G_SHEET_WORKSHEET_NAME = 'scraped_data_24'
-G_SHEET_PPO_WORKSHEET_NAME = 'ppo_data_24'
+NUM_PROCESSES = int(cpu_count() * 0.75)
 
-# --- Logging Configuration ---
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
-formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
-file_handler = logging.FileHandler('placement_data_consolidated.log', mode='w', encoding='utf-8')
+formatter = logging.Formatter('%(asctime)s - %(processName)s - %(levelname)s - %(message)s',
+                              datefmt='%Y-%m-%d %H:%M:%S')
+file_handler = logging.FileHandler('placement_data_parallel.log', mode='w', encoding='utf-8')
 file_handler.setFormatter(formatter)
 logger.addHandler(file_handler)
 stream_handler = logging.StreamHandler()
@@ -38,242 +40,252 @@ stream_handler.setFormatter(formatter)
 logger.addHandler(stream_handler)
 
 
+# --- Google Sheets Connection ---
 def get_gspread_client():
-    """Authenticates with Google and returns a gspread client object."""
+    """Authenticates with Google using service account credentials."""
     try:
         scopes = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
         creds = Credentials.from_service_account_file(GCP_CREDS_FILE, scopes=scopes)
-        client = gspread.authorize(creds)
-        logger.info("Successfully authenticated with Google Sheets API.")
-        return client
-    except Exception as e:
-        logger.error("Failed to authenticate with Google Sheets.", exc_info=True)
+        logger.info("MainProcess: Successfully authenticated with Google Sheets API.")
+        return gspread.authorize(creds)
+    except Exception:
+        logger.error("MainProcess: Failed to authenticate with Google Sheets.", exc_info=True)
         return None
 
 
-def process_job_listings(main_window_handle, worksheet, ppo_data_list):
-    """Handles pagination and scrapes consolidated job info, writing one row per company."""
-    page_number = 1
-    while True:
-        try:
-            logger.info(f"Processing page {page_number}...")
-            job_table = wait.until(EC.visibility_of_element_located((By.ID, "job-listings")))
-            job_rows = job_table.find_elements(By.XPATH, ".//tbody/tr")
-
-            jobs_on_page = []
-            for row in job_rows:
-                try:
-                    company_name = row.find_element(By.XPATH, ".//td[1]").text.strip()
-                    date_posted = row.find_element(By.XPATH, ".//td[3]").text.strip()
-
-                    view_apply_link = row.find_element(By.PARTIAL_LINK_TEXT, "View & Apply").get_attribute('href')
-                    updates_link = row.find_element(By.PARTIAL_LINK_TEXT, "Updates").get_attribute('href')
-                    jobs_on_page.append({
-                        "name": company_name, "date_posted": date_posted,
-                        "view_url": view_apply_link, "updates_url": updates_link
-                    })
-                except NoSuchElementException:
-                    try:
-                        action_cell_text = row.find_element(By.XPATH, ".//td[4]").text
-                        if "PPO" in action_cell_text:
-                            logger.info(f"Found PPO offering from: {company_name}")
-                            ppo_student_count = 0
-                            try:
-                                updates_link = row.find_element(By.PARTIAL_LINK_TEXT, "Updates").get_attribute('href')
-                                driver.execute_script("window.open(arguments[0], '_blank');", updates_link)
-                                driver.switch_to.window(driver.window_handles[-1])
-                                time.sleep(2)
-
-                                result_links = wait.until(EC.presence_of_all_elements_located(
-                                    (By.XPATH, "//div[h6/b[text()='Result']]//li/a")))
-                                if result_links:
-                                    result_url = result_links[0].get_attribute('href')
-                                    driver.get(result_url)
-                                    time.sleep(2)
-                                    student_rows = driver.find_elements(By.XPATH,
-                                                                        "//table[thead/tr/th[text()='SL']]/tbody/tr")
-                                    ppo_student_count = len(student_rows)
-                            except Exception:
-                                logger.warning(
-                                    f"Could not automatically determine PPO student count for {company_name}.")
-                            finally:
-                                driver.close()
-                                driver.switch_to.window(main_window_handle)
-
-                            ppo_data_list.append({'name': company_name, 'count': ppo_student_count})
-                        else:
-                            logger.warning(f"Skipping a row for '{company_name}' (may be missing standard links).")
-                    except Exception as e:
-                        logger.error(f"Could not process a non-standard row. Error: {e}")
-                    continue
-
-            logger.info(f"Found {len(jobs_on_page)} standard jobs on page {page_number}. Scraping details...")
-
-            for job in jobs_on_page:
-                company_data = {
-                    "company_name": job['name'], "date_posted": job['date_posted'],
-                    "arrived_for": "Not Found", "salaries_fte": [],
-                    "stipends_internship": [], "rounds_shortlists": []
-                }
-
-                # --- 1. Scrape "View & Apply" Page ---
-                driver.execute_script("window.open(arguments[0], '_blank');", job['view_url'])
-                driver.switch_to.window(driver.window_handles[-1])
-                time.sleep(2)
-
-                logger.info(f"--- Processing Company: {job['name']} ---")
-
-                try:
-                    arrived_for_elements = wait.until(
-                        EC.presence_of_all_elements_located((By.XPATH, "//h3/following-sibling::div//li")))
-                    company_data['arrived_for'] = ', '.join([elem.text for elem in arrived_for_elements])
-                except TimeoutException:
-                    logger.warning("Could not determine 'Arrived For' status.")
-
-                try:
-                    fte_table = driver.find_element(By.XPATH,
-                                                    "//b[contains(text(), 'SALARY DETAILS (PER ANNUM) - FTE')]/ancestor::table[1]")
-                    salary_rows = fte_table.find_elements(By.XPATH, ".//tbody/tr[.//td[contains(text(),'₹')]]")
-                    for s_row in salary_rows:
-                        ctc_raw = s_row.find_element(By.XPATH, ".//td[2]").text
-                        ctc = re.sub(r'[₹,]', '', ctc_raw).strip()
-                        if ctc and ctc != '0':
-                            programme = s_row.find_element(By.XPATH, ".//td[1]").text.split('\n')[0].strip()
-                            company_data['salaries_fte'].append({'programme': programme, 'ctc': ctc})
-                except NoSuchElementException:
-                    logger.info("FTE Salary details not found.")
-
-                try:
-                    stipend_table = driver.find_element(By.XPATH,
-                                                        "//b[contains(text(), 'STIPEND DETAILS - INTERNSHIP')]/ancestor::table[1]")
-                    stipend_rows = stipend_table.find_elements(By.XPATH, ".//tbody/tr")
-                    for st_row in stipend_rows:
-                        cell_text = st_row.find_element(By.XPATH, ".//td[1]").text
-                        match = re.search(r"For (UG|PG) ₹ (\d+)", cell_text)
-                        if match and match.group(2) != '0':
-                            company_data['stipends_internship'].append(
-                                {'programme': match.group(1), 'stipend': match.group(2)})
-                except NoSuchElementException:
-                    logger.info("Internship Stipend details not found.")
-
-                driver.close()
-                driver.switch_to.window(main_window_handle)
-
-                # --- 2. Scrape "Updates" Page ---
-                driver.execute_script("window.open(arguments[0], '_blank');", job['updates_url'])
-                driver.switch_to.window(driver.window_handles[-1])
-                time.sleep(2)
-
-                try:
-                    result_links = [{'name': elem.text, 'url': elem.get_attribute('href')} for elem in wait.until(
-                        EC.presence_of_all_elements_located((By.XPATH, "//div[h6/b[text()='Result']]//li/a")))]
-                    for link in result_links:
-                        driver.get(link['url'])  # Reuse tab
-                        time.sleep(2)
-                        student_rows = driver.find_elements(By.XPATH, "//table[thead/tr/th[text()='SL']]/tbody/tr")
-                        company_data['rounds_shortlists'].append({'round': link['name'], 'count': len(student_rows)})
-                except TimeoutException:
-                    logger.info("No 'Result' section found on the Updates page.")
-
-                driver.close()
-                driver.switch_to.window(main_window_handle)
-
-                # --- 3. Consolidate and Append Data ---
-                logger.info(f"Consolidated Data for {job['name']}: {company_data}")
-                row_to_append = [
-                    company_data['company_name'], company_data['date_posted'], company_data['arrived_for'],
-                    json.dumps(company_data['salaries_fte']), json.dumps(company_data['stipends_internship']),
-                    json.dumps(company_data['rounds_shortlists']), datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                ]
-                worksheet.append_row(row_to_append)
-
-            # --- 4. Pagination Logic ---
-            next_button_li = driver.find_element(By.ID, "job-listings_next")
-            if "disabled" in next_button_li.get_attribute("class"):
-                logger.info("Reached the last page for this year.")
-                break
-            else:
-                next_button_a = next_button_li.find_element(By.TAG_NAME, "a")
-                driver.execute_script("arguments[0].click();", next_button_a)
-                page_number += 1
-                time.sleep(3)
-        except Exception as e:
-            logger.error(f"An error occurred on page {page_number}:", exc_info=True)
-            break
+# BS4 Parsers
+def parse_main_page_with_bs(page_source):
+    """Parses the main jobs listing page to get company links and identify PPOs."""
+    soup = BeautifulSoup(page_source, 'html.parser')
+    jobs, ppos = [], []
+    job_table = soup.find('table', id='job-listings')
+    if not job_table or not job_table.find('tbody'): return jobs, ppos
+    for row in job_table.find('tbody').find_all('tr'):
+        cells = row.find_all('td')
+        if len(cells) < 4: continue
+        company_name, date_posted, action_cell = cells[0].text.strip(), cells[2].text.strip(), cells[3]
+        updates_link = action_cell.find('a', string='Updates')
+        view_apply_link = action_cell.find('a', string=re.compile(r'View\s*&\s*Apply'))
+        if "PPO" in action_cell.text and updates_link:
+            ppos.append({"name": company_name, "updates_url": urljoin(BASE_URL, updates_link['href'])})
+        elif updates_link and view_apply_link:
+            jobs.append({"name": company_name, "date_posted": date_posted,
+                         "view_url": urljoin(BASE_URL, view_apply_link['href']),
+                         "updates_url": urljoin(BASE_URL, updates_link['href'])})
+    return jobs, ppos
 
 
+def parse_view_apply_page_with_bs(page_source):
+    """Parses the 'View & Apply' page HTML to extract role, salary, and stipend info."""
+    soup = BeautifulSoup(page_source, 'html.parser')
+    data = {"arrived_for": "Not Found", "salaries_fte": [], "stipends_internship": []}
+    try:
+        arrived_for_list = soup.find('h3', string=re.compile(r'.*')).find_next_sibling('div').find_all('li')
+        data['arrived_for'] = ', '.join([li.text.strip() for li in arrived_for_list])
+    except Exception:
+        pass
+    try:
+        fte_header = soup.find('b', string=lambda t: t and 'SALARY DETAILS (PER ANNUM) - FTE' in t)
+        if fte_header:
+            for row in fte_header.find_parent('table').find('tbody').find_all('tr'):
+                cols = row.find_all('td')
+                if len(cols) > 1 and ('₹' in cols[1].text or re.search(r'\d', cols[1].text)):
+                    programme = cols[0].get_text(strip=True).split()[0]
+                    ctc = re.sub(r'[₹,]', '', cols[1].text).strip()
+                    if ctc and float(ctc) > 0: data['salaries_fte'].append({'programme': programme, 'ctc': ctc})
+    except Exception:
+        pass
+    try:
+        stipend_header = soup.find('b', string='STIPEND DETAILS - INTERNSHIP')
+        if stipend_header:
+            for row in stipend_header.find_parent('table').find_tbody().find_all('tr'):
+                match = re.search(r"For\s+(UG|PG)\s*<b>₹\s*([\d,]+)", str(row.find('td')))
+                if match:
+                    stipend = match.group(2).replace(',', '').strip()
+                    if stipend and float(stipend) > 0: data['stipends_internship'].append(
+                        {'programme': match.group(1), 'stipend': stipend})
+    except Exception:
+        pass
+    return data
+
+
+def parse_updates_page_with_bs(page_source):
+    """Parses the 'Updates' page to find links to shortlist/result pages."""
+    soup = BeautifulSoup(page_source, 'html.parser')
+    round_links = []
+    result_div = soup.find('div', style=lambda s: s and 'background-color:#c1fac3' in s)
+    if result_div:
+        for link in result_div.find_all('a'):
+            round_links.append({'name': link.text.strip(), 'url': urljoin(BASE_URL, link['href'])})
+    return round_links
+
+
+def parse_shortlist_page_with_bs(page_source):
+    """Parses a shortlist page to count the number of students."""
+    soup = BeautifulSoup(page_source, 'html.parser')
+    student_table = soup.find('table', class_='table-striped')
+    return len(student_table.find('tbody').find_all('tr')) if student_table and student_table.find('tbody') else 0
+
+
+def init_worker_browser(cookies):
+    """Initializes a headless browser for a worker and injects login cookies."""
+    worker_options = Options()
+    worker_options.add_argument("--headless")
+    worker_options.add_argument("--disable-gpu")
+    worker_options.add_argument("--window-size=1920x1080")
+    service = webdriver.ChromeService(executable_path=WEBDRIVER_PATH)
+    driver = webdriver.Chrome(service=service, options=worker_options)
+
+    driver.get(BASE_URL)
+    for name, value in cookies.items():
+        driver.add_cookie({'name': name, 'value': value})
+    return driver
+
+
+def scrape_job_worker(job_with_cookies):
+    """Worker function to scrape a single regular job posting."""
+    job, cookies = job_with_cookies
+    driver = init_worker_browser(cookies)
+    try:
+        driver.get(job['view_url'])
+        view_apply_data = parse_view_apply_page_with_bs(driver.page_source)
+
+        driver.get(job['updates_url'])
+        round_links = parse_updates_page_with_bs(driver.page_source)
+
+        rounds_data = []
+        for rd in round_links:
+            driver.get(rd['url'])
+            time.sleep(1)  # Small delay for page to render
+            count = parse_shortlist_page_with_bs(driver.page_source)
+            rounds_data.append({'round': rd['name'], 'count': count})
+
+        return [
+            job['name'], job['date_posted'], view_apply_data['arrived_for'],
+            json.dumps(view_apply_data['salaries_fte']),
+            json.dumps(view_apply_data['stipends_internship']),
+            json.dumps(rounds_data), datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        ]
+    except Exception as e:
+        # It's important to log errors from workers
+        logging.getLogger(__name__).error(f"Worker for {job['name']} failed: {e}")
+        return None
+    finally:
+        driver.quit()
+
+
+def scrape_ppo_worker(ppo_with_cookies):
+    """Worker function to scrape a single PPO posting."""
+    ppo, cookies = ppo_with_cookies
+    driver = init_worker_browser(cookies)
+    try:
+        driver.get(ppo['updates_url'])
+        round_links = parse_updates_page_with_bs(driver.page_source)
+        count = 0
+        if round_links:
+            driver.get(round_links[0]['url'])  # Assume first link is the final PPO list
+            time.sleep(1)
+            count = parse_shortlist_page_with_bs(driver.page_source)
+        return {'name': ppo['name'], 'count': count}
+    except Exception as e:
+        logging.getLogger(__name__).error(f"PPO Worker for {ppo['name']} failed: {e}")
+        return None
+    finally:
+        driver.quit()
+
+
+# --- MAIN SCRIPT LOGIC ---
 if __name__ == "__main__":
     gspread_client = get_gspread_client()
-    sheet, ppo_sheet = None, None
-    if gspread_client:
-        try:
-            GOOGLE_SHEET_KEY = os.getenv('GOOGLE_SHEET_KEY')
-            spreadsheet = gspread_client.open_by_key(GOOGLE_SHEET_KEY)
-            sheet = spreadsheet.worksheet(G_SHEET_WORKSHEET_NAME)
-            logger.info(f"Successfully connected to worksheet '{G_SHEET_WORKSHEET_NAME}'.")
-            try:
-                ppo_sheet = spreadsheet.worksheet(G_SHEET_PPO_WORKSHEET_NAME)
-                logger.info(f"Successfully connected to worksheet '{G_SHEET_PPO_WORKSHEET_NAME}'.")
-            except gspread.WorksheetNotFound:
-                logger.info(f"Worksheet '{G_SHEET_PPO_WORKSHEET_NAME}' not found. Creating it...")
-                ppo_sheet = spreadsheet.add_worksheet(title=G_SHEET_PPO_WORKSHEET_NAME, rows="100", cols="3")
-                ppo_sheet.append_row(['Company Name', 'PPO Student Count', 'Scrape Timestamp'])
-        except Exception as e:
-            logger.error(f"Could not open worksheet. Ensure Sheet ID is correct and shared.", exc_info=True)
+    if not gspread_client: exit()
 
-    if sheet and ppo_sheet:
+    main_driver = None
+    try:
         chrome_options = Options()
-        prefs = {"credentials_enable_service": False, "profile.password_manager_enabled": False}
-        chrome_options.add_experimental_option("prefs", prefs)
-        chrome_options.add_argument("--disable-features=Autofill")
-
+        chrome_options.add_experimental_option("prefs", {"credentials_enable_service": False,
+                                                         "profile.password_manager_enabled": False})
         service = webdriver.ChromeService(executable_path=WEBDRIVER_PATH)
-        driver = webdriver.Chrome(service=service, options=chrome_options)
-        wait = WebDriverWait(driver, 10)
+        main_driver = webdriver.Chrome(service=service, options=chrome_options)
+        wait = WebDriverWait(main_driver, 20)
 
-        all_ppo_data = []
+        main_driver.get(PORTAL_URL)
+        main_driver.maximize_window()
+        wait.until(EC.presence_of_element_located((By.ID, "identity"))).send_keys(USERNAME)
+        main_driver.find_element(By.ID, "password").send_keys(PASSWORD)
+        main_driver.find_element(By.XPATH, "//input[@value='Login']").click()
+        logger.info("MainProcess: Login successful. Extracting session cookies.")
+        wait.until(EC.presence_of_element_located((By.ID, "_placeyr")))
+        session_cookies = {cookie['name']: cookie['value'] for cookie in main_driver.get_cookies()}
 
-        try:
-            logger.info("Navigating to the placement portal...")
-            driver.get(PORTAL_URL)
-            driver.maximize_window()
-            logger.info("Entering login credentials...")
-            username_field = wait.until(EC.presence_of_element_located((By.ID, "identity")))
-            password_field = driver.find_element(By.ID, "password")
-            login_button = driver.find_element(By.XPATH, "//input[@value='Login']")
-            username_field.clear()
-            username_field.send_keys(USERNAME)
-            password_field.clear()
-            password_field.send_keys(PASSWORD)
-            login_button.click()
-            logger.info("Login successful.")
+        year_options = ['2025-26']
+        for year in year_options:
+            logger.info(f"====== STARTING YEAR: {year} ======")
+            worksheet_main_name = f"scraped_data_{year.split('-')[0][-2:]}"
+            worksheet_ppo_name = f"ppo_data_{year.split('-')[0][-2:]}"
 
-            wait.until(EC.presence_of_element_located((By.ID, "_placeyr")))
-            main_window_handle = driver.current_window_handle
-            year_options = ['2024-25']
+            try:
+                spreadsheet = gspread_client.open_by_key(G_SHEET_ID)
+                main_sheet = spreadsheet.worksheet(worksheet_main_name)
+                try:
+                    ppo_sheet = spreadsheet.worksheet(worksheet_ppo_name)
+                except gspread.WorksheetNotFound:
+                    logger.info(f"MainProcess: Worksheet '{worksheet_ppo_name}' not found. Creating it...")
+                    ppo_sheet = spreadsheet.add_worksheet(title=worksheet_ppo_name, rows="100", cols="3")
+                    ppo_sheet.append_row(['Company Name', 'PPO Student Count', 'Scrape Timestamp'])
+            except Exception as e:
+                logger.error(f"MainProcess: Cannot open worksheets for year {year}. Skipping. Error: {e}")
+                continue
 
-            for year in year_options:
-                logger.info(f"--- Processing Year: {year} ---")
-                select_element = wait.until(EC.presence_of_element_located((By.ID, "_placeyr")))
-                Select(select_element).select_by_visible_text(year)
-                time.sleep(3)
-                process_job_listings(main_window_handle, sheet, all_ppo_data)
+            Select(wait.until(EC.presence_of_element_located((By.ID, "_placeyr")))).select_by_visible_text(year)
+            time.sleep(3)
 
-        except Exception as e:
-            logger.error("An unexpected error occurred in the main script:", exc_info=True)
-        finally:
-            unique_ppo_data = [dict(t) for t in {tuple(d.items()) for d in all_ppo_data}]
-            logger.info("--- SCRIPT COMPLETE ---")
-            if unique_ppo_data:
-                logger.info(f"Uploading PPO data for {len(unique_ppo_data)} companies to Google Sheets...")
-                rows_to_add = [[item['name'], item['count'], datetime.now().strftime('%Y-%m-%d %H:%M:%S')] for item in
-                               unique_ppo_data]
-                ppo_sheet.append_rows(rows_to_add)
-                logger.info("PPO data upload complete.")
-            else:
-                logger.info("No PPO offerings were found during this run.")
+            page_number = 1
+            while True:
+                logger.info(f"--- MainProcess: Processing Page {page_number} for year {year} ---")
+                wait.until(EC.presence_of_element_located((By.ID, "job-listings_info")))
+                time.sleep(2)
 
-            logger.info("The browser will close in 15 seconds...")
-            time.sleep(15)
-            driver.quit()
+                jobs_on_page, ppos_on_page = parse_main_page_with_bs(main_driver.page_source)
 
+                if jobs_on_page:
+                    work_items = [(job, session_cookies) for job in jobs_on_page]
+                    with Pool(processes=NUM_PROCESSES) as pool:
+                        results = pool.map(scrape_job_worker, work_items)
+                    successful_results = [res for res in results if res is not None]
+                    if successful_results:
+                        main_sheet.append_rows(successful_results, value_input_option='USER_ENTERED')
+                        logger.info(
+                            f"MainProcess: Uploaded {len(successful_results)} job rows from page {page_number}.")
+
+                if ppos_on_page:
+                    ppo_work_items = [(ppo, session_cookies) for ppo in ppos_on_page]
+                    with Pool(processes=NUM_PROCESSES) as pool:
+                        ppo_results = pool.map(scrape_ppo_worker, ppo_work_items)
+                    successful_ppos = [res for res in ppo_results if res is not None]
+                    if successful_ppos:
+                        rows_to_add = [[item['name'], item['count'], datetime.now().strftime('%Y-%m-%d %H:%M:%S')] for
+                                       item in successful_ppos]
+                        ppo_sheet.append_rows(rows_to_add)
+                        logger.info(f"MainProcess: Uploaded {len(successful_ppos)} PPO rows from page {page_number}.")
+
+                try:
+                    WebDriverWait(main_driver, 5).until(
+                        EC.presence_of_element_located((By.ID, "job-listings_paginate")))
+                    next_button = main_driver.find_element(By.ID, "job-listings_next")
+                    if "disabled" in next_button.get_attribute("class"):
+                        logger.info(f"MainProcess: Reached the last page for year {year}.")
+                        break
+                    main_driver.execute_script("arguments[0].click();", next_button.find_element(By.TAG_NAME, "a"))
+                    page_number += 1
+                except (NoSuchElementException, TimeoutException):
+                    logger.info(f"MainProcess: No more pages found for year {year}.")
+                    break
+
+            logger.info(f"====== COMPLETED YEAR: {year} ======")
+
+    except Exception as e:
+        logger.error(f"A critical error occurred in the main script: {e}", exc_info=True)
+    finally:
+        if main_driver:
+            main_driver.quit()
+        logger.info("--- SCRIPT COMPLETE ---")
