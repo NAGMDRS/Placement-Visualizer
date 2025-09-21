@@ -23,8 +23,8 @@ USERNAME = os.getenv('TPUSERNAME')
 PASSWORD = os.getenv('PASSWORD')
 WEBDRIVER_PATH = os.getenv('WEBDRIVER_PATH')
 GCP_CREDS_FILE = 'credentials.json'
-G_SHEET_WORKSHEET_NAME = 'scraped_data_25'
-G_SHEET_PPO_WORKSHEET_NAME = 'ppo_data_25'
+G_SHEET_WORKSHEET_NAME = 'scraped_data_24'
+G_SHEET_PPO_WORKSHEET_NAME = 'ppo_data_24'
 
 # --- Logging Configuration ---
 logger = logging.getLogger(__name__)
@@ -250,7 +250,7 @@ if __name__ == "__main__":
 
             wait.until(EC.presence_of_element_located((By.ID, "_placeyr")))
             main_window_handle = driver.current_window_handle
-            year_options = ['2025-26']
+            year_options = ['2024-25']
 
             for year in year_options:
                 logger.info(f"--- Processing Year: {year} ---")
