@@ -4,3 +4,6 @@ credentials.json
 temp.py
 placement_data_consolidated.log
 placement_data_hybrid.log
+.streamlit/secrets.toml
+placement_data_multiprocess.log
+placement_data_parallel.log
